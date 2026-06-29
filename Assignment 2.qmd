@@ -1,0 +1,691 @@
+---
+title: "Inside Credit Risk: What Drives Mortgage Borrower Default?"
+author: "Sri Manju Baargavi Rangaraj Ganesh (48780901)"
+format: pdf
+editor: visual
+execute:
+  warning: false
+  message: false
+  fig-width: 7
+  fig-height: 5
+---
+
+# Introduction
+
+Mortgage lending is built on uncertainty. Every approved home loan represents a judgement about the future: whether a borrower will continue to meet repayment obligations despite changes in income, interest rates, employment, or wider economic conditions. When those judgements fail at scale, the consequences can extend far beyond individual households. The 2008 global financial crisis demonstrated how rising mortgage defaults can destabilize financial institutions, weaken housing markets, and create widespread economic disruption. As a result, accurately identifying high-risk borrowers remains one of the most important challenges in modern credit risk management.
+
+At the same time, financial institutions now have access to increasingly large volumes of borrower and loan data, creating new opportunities for predictive analytics and machine learning to support lending decisions. However, improving predictive performance alone is not enough. Lenders must also understand which borrower characteristics are associated with elevated default risk and whether complex machine learning models provide meaningful advantages over simpler, more interpretable approaches.
+
+This analysis examines more than 420,000 residential mortgage loans acquired by Fannie Mae in the United States to investigate the factors most strongly linked to mortgage borrower default. Using borrower financial characteristics, loan structure information, and repayment outcomes, the study compares logistic regression, random forest, and XGBoost models while exploring the broader drivers of mortgage risk.
+
+The findings show that weaker credit quality, higher debt burdens, and greater loan leverage were consistently associated with increased default risk. Interestingly, simpler interpretable models performed competitively against more advanced machine learning techniques, reinforcing the continuing importance of traditional financial risk indicators in lending and risk assessment decisions.
+
+# The Analysis
+
+The analysis used a large-scale dataset containing more than 420,000 residential mortgage loans acquired by Fannie Mae in the United States. Each loan included information about borrower finances, loan structure, property characteristics, and repayment outcomes, making it possible to explore how different financial and lending factors relate to mortgage default risk in real-world conditions.
+
+Rather than examining every available variable, the analysis focused on borrower and loan characteristics that lenders would realistically consider during the loan approval process. Particular attention was given to factors such as borrower credit quality, debt burden, loan leverage, interest rates, occupancy status, and mortgage insurance. Variables directly linked to events occurring after serious delinquency or foreclosure were intentionally excluded to ensure that the models reflected realistic prediction conditions rather than hindsight information.
+
+The investigation began with exploratory analysis to better understand the broader patterns within the dataset. One of the clearest early findings was that mortgage defaults were relatively rare, representing only a small proportion of all loans.
+
+```{r}
+#| label: setup
+#| include: false
+
+library(tidyverse)
+library(tidymodels)
+library(vip)
+library(janitor)
+library(skimr)
+
+set.seed(123)
+```
+
+```{r}
+#| label: load-data
+#| include: false
+fannie_mae <- read_csv("fannie_mae.csv", show_col_types = FALSE)
+
+glimpse(fannie_mae)
+dim(fannie_mae)
+```
+
+```{r}
+#| label: create-target
+#| include: false
+fannie_mae <- fannie_mae %>%
+  mutate(
+    default = if_else(!is.na(F120_DTE), "Default", "No Default"),
+    default = factor(default, levels = c("Default", "No Default"))
+  )
+
+fannie_mae %>%
+  count(default) %>%
+  mutate(percent = round(n / sum(n) * 100, 2))
+```
+
+```{r}
+#| label: remove-leakage
+#| include: false
+remove_vars <- c(
+  "F30_DTE", "F60_DTE", "F90_DTE", "F120_DTE",
+  "F30_UPB", "F60_UPB", "F90_UPB", "F120_UPB",
+  "NET_LOSS", "NET_SEV",
+  "LAST_STAT",
+  "FCC_COST", "PP_COST", "AR_COST",
+  "IE_COST", "TAX_COST",
+  "NS_PROCS", "CE_PROCS",
+  "RMW_PROCS", "O_PROCS",
+  "MOD_FLAG", "FMOD_DTE",
+  "MODTOT_COST"
+)
+
+fannie_mae <- fannie_mae %>%
+  select(-any_of(remove_vars))
+```
+
+```{r}
+#| label: select-predictors
+#| include: false
+selected_vars <- c(
+  "default",
+  "CSCORE_MN",
+  "dti",
+  "oltv",
+  "ocltv",
+  "orig_rt",
+  "orig_amt",
+  "FTHB_FLG",
+  "purpose",
+  "PROP_TYP",
+  "NUM_UNIT",
+  "occ_stat",
+  "num_bo",
+  "MI_TYPE",
+  "mi_pct",
+  "state"
+)
+
+fannie_mae_model <- fannie_mae %>%
+  select(all_of(selected_vars))
+
+glimpse(fannie_mae_model)
+```
+
+```{r}
+#| label: missing-values
+#| include: false
+fannie_mae_model %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "missing_count"
+  ) %>%
+  arrange(desc(missing_count))
+```
+
+```{r}
+#| label: default-distribution
+#| echo: false
+#| warning: false
+#| message: false
+fannie_mae_model %>%
+  count(default) %>%
+  mutate(percent = n / sum(n) * 100) %>%
+  ggplot(aes(x = default, y = percent, fill = default)) +
+  geom_col() +
+  geom_text(
+    aes(label = paste0(round(percent, 2), "%")),
+    vjust = -0.3,
+    size = 5
+  ) +
+  labs(
+  title = "Mortgage Defaults Were Relatively Rare",
+  x = "Loan Outcome",
+  y = "Percentage of Loans"
+) +
+expand_limits(y = 105) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+Mortgage defaults accounted for just over 3% of all loans within the dataset, highlighting the difficulty lenders face when identifying high-risk borrowers within a predominantly low-risk portfolio. This imbalance also reinforced the importance of using evaluation measures beyond simple accuracy when assessing predictive models.
+
+Another clear pattern emerged when examining borrower credit quality. Default rates increased substantially among borrowers with weaker credit histories, suggesting that credit score remained one of the strongest indicators of mortgage repayment behaviour.
+
+```{r}
+#| label: credit-score-groups
+#| include: false
+fannie_mae_model <- fannie_mae_model %>%
+  mutate(
+    credit_group = case_when(
+      CSCORE_MN < 620 ~ "Poor",
+      CSCORE_MN < 680 ~ "Fair",
+      CSCORE_MN < 740 ~ "Good",
+      TRUE ~ "Excellent"
+    ),
+    credit_group = factor(
+      credit_group,
+      levels = c("Poor", "Fair", "Good", "Excellent")
+    )
+  )
+```
+
+```{r}
+#| label: credit-score-default-rate
+#| echo: false
+#| warning: false
+#| message: false
+fannie_mae_model %>%
+  group_by(credit_group, default) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(credit_group) %>%
+  mutate(prop = n / sum(n)) %>%
+  filter(default == "Default") %>%
+  ggplot(aes(x = credit_group, y = prop, fill = credit_group)) +
+  geom_col() +
+  geom_text(
+    aes(label = scales::percent(prop, accuracy = 0.1)),
+    vjust = -0.3,
+    size = 5
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Lower Credit Scores Were Associated with Higher Default Risk",
+    x = "Credit Score Category",
+    y = "Default Rate"
+  ) +
+  expand_limits(y = 0.12) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+Borrowers classified within lower credit score categories experienced significantly higher default rates than borrowers with stronger credit profiles. This finding reinforced the importance of borrower creditworthiness in long-term mortgage performance and aligned closely with traditional credit risk assessment practices used within the lending industry.
+
+The analysis also revealed a strong relationship between debt burden and mortgage risk. As borrower debt-to-income ratios increased, default rates rose steadily across the dataset.
+
+```{r}
+#| label: dti-groups
+#| include: false
+fannie_mae_model <- fannie_mae_model %>%
+  mutate(
+    dti_group = case_when(
+      dti < 20 ~ "Low",
+      dti < 35 ~ "Moderate",
+      dti < 45 ~ "High",
+      TRUE ~ "Very High"
+    ),
+    dti_group = factor(
+      dti_group,
+      levels = c("Low", "Moderate", "High", "Very High")
+    )
+  )
+```
+
+```{r}
+#| label: dti-default-rate
+#| echo: false
+#| warning: false
+#| message: false
+fannie_mae_model %>%
+  group_by(dti_group, default) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(dti_group) %>%
+  mutate(prop = n / sum(n)) %>%
+  filter(default == "Default") %>%
+  ggplot(aes(x = dti_group, y = prop, fill = dti_group)) +
+  geom_col() +
+  geom_text(
+    aes(label = scales::percent(prop, accuracy = 0.1)),
+    vjust = -0.3,
+    size = 5
+  ) +
+  scale_y_continuous(
+    labels = scales::percent
+  ) +
+  labs(
+    title = "Higher Debt Burdens Were Linked to Increased Default Risk",
+    x = "Debt-to-Income Category",
+    y = "Default Rate"
+  ) +
+  expand_limits(y = 0.10) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+Borrowers carrying higher levels of debt relative to income were substantially more likely to experience mortgage delinquency. This suggests that financial stress and repayment pressure remain major contributors to mortgage default risk, even among borrowers who initially qualified for loan approval.
+
+Loan leverage produced a similarly important pattern. Borrowers with higher loan-to-value ratios consistently displayed elevated default rates compared with borrowers who held greater equity in their homes.
+
+```{r}
+#| label: ltv-groups
+#| include: false
+fannie_mae_model <- fannie_mae_model %>%
+  mutate(
+    ltv_group = case_when(
+      oltv < 60 ~ "Low",
+      oltv < 80 ~ "Moderate",
+      oltv < 90 ~ "High",
+      TRUE ~ "Very High"
+    ),
+    ltv_group = factor(
+      ltv_group,
+      levels = c("Low", "Moderate", "High", "Very High")
+    )
+  )
+```
+
+```{r}
+#| label: ltv-default-rate
+#| echo: false
+#| warning: false
+#| message: false
+fannie_mae_model %>%
+  group_by(ltv_group, default) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(ltv_group) %>%
+  mutate(prop = n / sum(n)) %>%
+  filter(default == "Default") %>%
+  ggplot(aes(x = ltv_group, y = prop, fill = ltv_group)) +
+  geom_col() +
+  geom_text(
+    aes(label = scales::percent(prop, accuracy = 0.1)),
+    vjust = -0.3,
+    size = 5
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Higher Loan Leverage Was Associated with Greater Default Risk",
+    x = "Loan-to-Value Category",
+    y = "Default Rate"
+  ) +
+  expand_limits(y = 0.10) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+Higher loan-to-value ratios were associated with noticeably greater default risk, indicating that borrowers with limited equity exposure were more financially vulnerable when repayment conditions became more difficult. Together, these early findings established a consistent pattern linking mortgage default risk to borrower financial resilience, debt burden, and loan leverage.
+
+To further investigate these relationships, three predictive modelling approaches were explored: logistic regression, random forest, and XGBoost. Logistic regression was included as a transparent baseline model that prioritized interpretability, while the machine learning models were used to determine whether more flexible approaches could better capture complex borrower risk patterns within the data. Model performance was evaluated primarily using ROC AUC, which provided a more reliable measure of predictive quality for the highly imbalanced mortgage default classification problem. ROC AUC was particularly important because mortgage defaults were relatively rare within the dataset, making simple accuracy less informative for assessing whether models could successfully identify genuinely high-risk borrowers.
+
+# Key Findings
+
+```{r}
+#| label: train-test-split
+#| include: false
+set.seed(123)
+
+split <- initial_split(
+  fannie_mae_model,
+  prop = 0.8,
+  strata = default
+)
+
+train_data <- training(split)
+test_data  <- testing(split)
+
+#| label: final-model-data
+
+train_data <- train_data %>%
+  select(-credit_group, -dti_group, -ltv_group)
+
+test_data <- test_data %>%
+  select(-credit_group, -dti_group, -ltv_group)
+
+
+dim(train_data)
+dim(test_data)
+
+```
+
+```{r}
+#| label: recipe
+#| include: false
+credit_recipe <- recipe(default ~ ., data = train_data) %>%
+  
+  # Impute numeric missing values
+  step_impute_median(all_numeric_predictors()) %>%
+  
+  # Impute categorical missing values
+  step_impute_mode(all_nominal_predictors()) %>%
+  
+  # Convert categorical variables into dummy variables
+  step_dummy(all_nominal_predictors()) %>%
+  
+  # Remove zero variance predictors
+  step_zv(all_predictors()) %>%
+  
+  # Normalize numeric predictors
+  step_normalize(all_numeric_predictors())
+
+prep(credit_recipe)
+```
+
+```{r}
+#| label: logistic-model
+#| include: false
+log_reg_model <- logistic_reg() %>%
+  set_engine("glm")
+
+#| label: logistic-workflow
+
+log_reg_workflow <- workflow() %>%
+  add_recipe(credit_recipe) %>%
+  add_model(log_reg_model)
+
+#| label: logistic-fit
+
+log_reg_fit <- fit(
+  log_reg_workflow,
+  data = train_data
+)
+```
+
+```{r}
+#| label: logistic-predictions
+#| include: false
+log_reg_predictions <- predict(
+  log_reg_fit,
+  test_data,
+  type = "prob"
+) %>%
+  bind_cols(
+    predict(log_reg_fit, test_data),
+    test_data %>% select(default)
+  )
+```
+
+```{r}
+#| label: logistic-roc
+#| include: false
+roc_auc(
+  log_reg_predictions,
+  truth = default,
+  .pred_Default
+)
+```
+
+```{r}
+#| label: random-forest-model
+#| include: false
+rf_model <- rand_forest(
+  trees = 100,
+  mtry = 4,
+  min_n = 20
+) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+#| label: random-forest-workflow
+#| include: false
+rf_workflow <- workflow() %>%
+  add_recipe(credit_recipe) %>%
+  add_model(rf_model)
+```
+
+```{r}
+#| label: random-forest-fit
+#| include: false
+rf_fit <- fit(
+  rf_workflow,
+  data = train_data
+)
+```
+
+```{r}
+#| label: random-forest-predictions
+#| include: false
+rf_predictions <- predict(
+  rf_fit,
+  test_data,
+  type = "prob"
+) %>%
+  bind_cols(
+    predict(rf_fit, test_data),
+    test_data %>% select(default)
+  )
+```
+
+```{r}
+#| label: random-forest-roc
+#| include: false
+roc_auc(
+  rf_predictions,
+  truth = default,
+  .pred_Default
+)
+```
+
+```{r}
+#| include: false
+library(xgboost)
+```
+
+```{r}
+#| label: xgboost-model
+#| include: false
+xgb_model <- boost_tree(
+  trees = 100,
+  tree_depth = 4,
+  learn_rate = 0.05,
+  loss_reduction = 0,
+  sample_size = 0.8,
+  mtry = 8,
+  min_n = 20
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+#| label: xgboost-workflow
+#| include: false
+xgb_workflow <- workflow() %>%
+  add_recipe(credit_recipe) %>%
+  add_model(xgb_model)
+```
+
+```{r}
+#| label: xgboost-fit
+#| include: false
+xgb_fit <- fit(
+  xgb_workflow,
+  data = train_data
+)
+```
+
+```{r}
+#| label: xgboost-predictions
+#| include: false
+xgb_predictions <- predict(
+  xgb_fit,
+  test_data,
+  type = "prob"
+) %>%
+  bind_cols(
+    predict(xgb_fit, test_data),
+    test_data %>% select(default)
+  )
+```
+
+```{r}
+#| label: xgboost-roc
+#| include: false
+roc_auc(
+  xgb_predictions,
+  truth = default,
+  .pred_Default
+)
+```
+
+The predictive modelling results showed that all three approaches demonstrated a reasonable ability to distinguish higher-risk borrowers from lower-risk borrowers. However, the differences between models were smaller than expected, suggesting that many of the key drivers of mortgage default were already captured effectively through traditional financial risk indicators.
+
+```{r}
+#| label: model-comparison
+#| echo: false
+#| warning: false
+#| message: false
+model_results <- tibble(
+  Model = c(
+    "Logistic Regression",
+    "Random Forest",
+    "XGBoost"
+  ),
+  ROC_AUC = c(
+    0.757,
+    0.746,
+    0.750
+  )
+)
+model_results %>%
+  mutate(ROC_AUC = round(ROC_AUC, 3)) %>%
+  knitr::kable(caption = "Model performance comparison")
+```
+
+Although the machine learning models provided slightly different classification behaviour, logistic regression ultimately produced the strongest overall predictive performance, achieving an ROC AUC of approximately 0.757. Random forest and XGBoost models performed similarly but did not substantially outperform the simpler baseline approach.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+ggplot(model_results,
+       aes(x = reorder(Model, ROC_AUC),
+           y = ROC_AUC,
+           fill = Model)) +
+  geom_col() +
+  geom_text(
+    aes(label = round(ROC_AUC, 3)),
+    vjust = -0.3,
+    size = 5
+  ) +
+  labs(
+    title = "Model Performance Comparison",
+    x = "Model",
+    y = "ROC AUC"
+  ) +
+  coord_cartesian(ylim = c(0.72, 0.77)) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+One of the most interesting findings from the analysis was that more advanced machine learning approaches did not meaningfully improve predictive performance over the simpler logistic regression model, despite their greater flexibility and complexity. This suggests that mortgage default behaviour within the dataset was driven largely by relatively stable and interpretable financial relationships rather than highly complex nonlinear interactions.
+
+From a practical perspective, this finding is important for lenders and financial institutions. Simpler models such as logistic regression are easier to interpret, audit, explain to regulators, and deploy operationally. In highly regulated financial environments, transparency can be just as valuable as marginal improvements in predictive accuracy.
+
+To further understand the factors influencing mortgage risk, the analysis examined the most influential predictors identified by the logistic regression model.
+
+```{r}
+#| label: logistic-coefficients
+#| echo: false
+#| warning: false
+#| message: false
+log_reg_fit %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  filter(term != "(Intercept)") %>%
+  arrange(desc(abs(estimate))) %>%
+  select(term, estimate) %>%
+  mutate(estimate = round(estimate, 3)) %>%
+  slice(1:10) %>%
+  knitr::kable(caption = "Most influential predictors from the logistic regression model")
+```
+
+The coefficient analysis identified credit score, combined loan-to-value ratio, debt-to-income ratio, number of borrowers, and loan amount as highly influential predictors. Together with the exploratory plots, these results reinforce that borrower credit quality, financial stress, and loan leverage are central to default risk.
+
+Several additional patterns also emerged. Borrowers with multiple co-borrowers displayed different repayment behaviour compared with single-borrower loans, while mortgage insurance and loan purpose variables also contributed meaningfully to default prediction. Together, these findings suggest that mortgage default risk is shaped not by a single factor, but by the interaction between borrower financial resilience, repayment pressure, and loan structure.
+
+The ROC curve comparison further illustrated the relatively similar performance of the three modelling approaches while confirming the competitive performance of logistic regression across different classification thresholds.
+
+```{r}
+#| label: roc-data
+#| include: false
+log_reg_roc <- roc_curve(
+  log_reg_predictions,
+  truth = default,
+  .pred_Default
+) %>%
+  mutate(Model = "Logistic Regression")
+
+rf_roc <- roc_curve(
+  rf_predictions,
+  truth = default,
+  .pred_Default
+) %>%
+  mutate(Model = "Random Forest")
+
+xgb_roc <- roc_curve(
+  xgb_predictions,
+  truth = default,
+  .pred_Default
+) %>%
+  mutate(Model = "XGBoost")
+
+roc_data <- bind_rows(
+  log_reg_roc,
+  rf_roc,
+  xgb_roc
+)
+```
+
+```{r}
+#| label: roc-curve-plot
+#| echo: false
+#| warning: false
+#| message: false
+ggplot(roc_data,
+       aes(x = 1 - specificity,
+           y = sensitivity,
+           color = Model)) +
+  geom_path(size = 1.2) +
+  geom_abline(
+    linetype = "dashed",
+    color = "gray50"
+  ) +
+  labs(
+    title = "ROC Curve Comparison Across Models",
+    x = "False Positive Rate",
+    y = "True Positive Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+```
+
+Overall, the findings demonstrated that traditional financial risk indicators remain highly informative in mortgage lending environments. While advanced machine learning models may provide incremental predictive improvements in some situations, this analysis suggests that transparent and interpretable approaches can still perform competitively when supported by strong borrower and loan-level financial information.
+
+# Implications
+
+The findings from this analysis highlight how strongly mortgage default risk is linked to borrower financial resilience. Borrowers with weaker credit histories, higher debt burdens, and limited equity exposure consistently displayed greater repayment risk across the dataset. For lenders, this reinforces the importance of evaluating affordability and financial stress holistically rather than relying on single approval thresholds alone.
+
+These insights could support more targeted lending decisions and earlier risk intervention strategies. Borrowers showing combinations of high debt-to-income ratios and high loan-to-value ratios may benefit from closer monitoring or additional financial support before severe delinquency occurs. From a portfolio management perspective, identifying these higher-risk patterns early may also help institutions manage exposure more effectively during periods of economic uncertainty or rising interest rates.
+
+One of the more interesting findings was that logistic regression performed competitively against more advanced machine learning approaches. In practice, this matters because simpler models are often easier to explain, audit, and justify within highly regulated lending environments. While complex machine learning models may offer incremental predictive improvements, financial institutions must balance predictive performance against transparency, fairness, and regulatory accountability.
+
+The analysis also highlights the broader importance of responsible use of predictive analytics within mortgage lending. Predictive models can improve risk assessment efficiency, but they should support, not replace human judgement. As lending decisions increasingly rely on data-driven systems, ensuring fairness, transparency, and ongoing monitoring will remain essential for both financial institutions and borrowers.
+
+# Conclusion
+
+This analysis explored the factors most strongly associated with mortgage borrower default using more than 420,000 residential mortgage loans acquired by Fannie Mae in the United States. Across both the exploratory analysis and predictive modelling stages, the findings consistently showed that weaker credit quality, higher debt burdens, and greater loan leverage were strongly linked to elevated default risk.
+
+While advanced machine learning approaches such as random forest and XGBoost performed reasonably well, the results showed that simpler interpretable models remained highly competitive. This suggests that many of the key drivers of mortgage default are still grounded in relatively stable financial relationships that lenders have relied on for decades. In practice, this is important because transparent models are often easier to explain, regulate, and apply within real lending environments.
+
+More broadly, the findings reinforce the importance of balancing predictive accuracy with responsible and explainable decision-making. As financial institutions continue to adopt data-driven risk assessment systems, predictive models should support human judgement rather than replace it entirely.
+
+Although the analysis identified several strong predictors of mortgage default, the data set could not fully capture external influences such as changing economic conditions, employment shocks, or borrower behaviour over time. Future work could explore how broader economic indicators and time-based trends influence mortgage risk under different market conditions.
+
+Overall, the analysis demonstrates that effective mortgage risk assessment depends not only on predictive performance, but also on understanding the financial realities that shape borrower vulnerability and long-term repayment behaviour.
